@@ -11,7 +11,7 @@ export LC_ALL=C
 umask 077
 [[ ${EUID} -eq 0 ]] || { echo 'Run with sudo bash php-security-check.sh'; exit 1; }
 [[ -t 0 ]] || { echo 'Interactive terminal required.'; exit 1; }
-for c in rpm find sort awk tee mktemp; do command -v "$c" >/dev/null || { echo "Missing: $c"; exit 1; }; done
+for c in rpm find sort awk tee mktemp timeout; do command -v "$c" >/dev/null || { echo "Missing: $c"; exit 1; }; done
 if command -v dnf >/dev/null; then PM=dnf
 elif command -v yum >/dev/null; then PM=yum
 else echo 'This script requires yum or dnf and RPM.'; exit 1; fi
@@ -19,11 +19,54 @@ OUT=$(mktemp -d /var/tmp/php-security-XXXXXXXX)
 LOG="$OUT/operation.log"
 exec 3>&1
 exec >>"$LOG" 2>&1
-trap 'rc=$?; echo "ERROR line $LINENO exit=$rc"; printf "\033[1;31mOperation failed; see %s\033[0m\n" "$LOG" >&3; exit "$rc"' ERR
+trap 'rc=$?; echo "ERROR line $LINENO exit=$rc command=$BASH_COMMAND"; printf "\033[1;31mERROR: operation failed at line %s (exit %s). Log: %s\033[0m\n" "$LINENO" "$rc" "$LOG" >&3; exit "$rc"' ERR
 trap 'printf "\033[1;33mInterrupted; see %s\033[0m\n" "$LOG" >&3; exit 130' INT TERM
 RED=$'\033[1;31m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; BLUE=$'\033[1;36m'; RESET=$'\033[0m'
 color() { printf '%s%s%s\n' "$1" "$2" "$RESET" >&3; printf '%s\n' "$2"; }
-color "$BLUE" 'NAS Solutions | PHP Security Check v2.1'
+# Stream only error lines to the terminal; keep all command output in its log.
+ERROR_COUNT=0
+REPO_FAILED=0
+PM_SEQUENCE=0
+pm_run() {
+  local mode=$1 rc=0 capture worker monitor
+  shift
+  PM_SEQUENCE=$((PM_SEQUENCE + 1))
+  capture="$OUT/pm-$PM_SEQUENCE.txt"
+  : > "$capture"
+  : > "$capture"
+  : > "$capture"
+  : > "$capture"
+  : > "$capture"
+  if [[ "$mode" == query ]]; then
+    timeout --signal=TERM --kill-after=5 90 "$PM" --setopt=timeout=15 --setopt=retries=1 "$@" >"$capture" 2>&1 &
+  else
+    # Never forcibly terminate a package transaction: RPM may be writing its database.
+    "$PM" --setopt=timeout=15 --setopt=retries=1 "$@" >"$capture" 2>&1 &
+  fi
+  worker=$!
+  (
+    trap - ERR
+    tail -n +1 --pid="$worker" -f "$capture" |
+      awk 'tolower($0) ~ /error|failed|fatal|cannot|could not|curl.*\([0-9]+\)/ {
+        if (++n <= 4) {printf "\033[1;31m  ERROR: %s\033[0m\n", $0; fflush()}
+      }' >&3
+  ) &
+  monitor=$!
+  wait "$worker" || rc=$?
+  wait "$monitor" || true
+  cat "$capture"
+  case "$rc" in
+    0|100) ;;
+    *) ERROR_COUNT=$((ERROR_COUNT + 1))
+       if [[ "$rc" == 124 || "$rc" == 137 ]]; then
+         color "$RED" "  ERROR: $PM repository query timed out (90s); see $LOG"
+       else
+         color "$RED" "  ERROR: $PM ${*} failed (exit $rc); see $LOG"
+       fi;;
+  esac
+  return "$rc"
+}
+color "$BLUE" 'NAS Solutions | PHP Security Check v2.2'
 color "$GREEN" 'Copyright (c) 2026 NAS Solutions. All rights reserved.'
 color "$BLUE" 'https://nassolutions.sa'
 # All diagnostic commands use the log by default. FD 3 is reserved for minimal UI.
@@ -46,7 +89,7 @@ echo 'Take a tested backup/snapshot first. Updates and restarts may interrupt we
 
 echo "OS and repository context:"
 cat /etc/os-release 2>/dev/null || true
-"$PM" repolist || true
+pm_run query repolist || REPO_FAILED=1
 packages() {
   rpm -qa --qf '%{NAME}\n' | awk '/^(php($|-)|php[0-9]+-php($|-)|ea-php[0-9]+($|-)|alt-php([0-9]+|-internal)($|-)|lsphp[0-9]*($|-))/' | sort -u
 }
@@ -107,7 +150,9 @@ diagnose_updates() {
   local stage=$1 path version minimum state owner vendor result rc
   local file="$OUT/diagnosis-$stage.tsv"
   : > "$file"
-  "$PM" repolist --all > "$OUT/repositories-$stage.txt" 2>&1 || true
+  if ((REPO_FAILED == 0)); then
+    pm_run query repolist --all > "$OUT/repositories-$stage.txt" 2>&1 || REPO_FAILED=1
+  fi
   grep -RniE '^[[:space:]]*(exclude|excludepkgs|includepkgs)[[:space:]]*=' \
     /etc/dnf/dnf.conf /etc/yum.conf /etc/yum.repos.d/ > "$OUT/exclusions-$stage.txt" 2>&1 || true
   # Existing locks are evidence only. Never remove them automatically.
@@ -130,21 +175,34 @@ diagnose_updates() {
        grep -q 'CVE-2026-109619' "$OUT/changelog-$stage-$owner.txt"; then
       printf '%s\tBACKPORT_EVIDENCE\tchangelog mentions both CVEs; verify exact vendor advisory/build\n' "$owner" >> "$file"
     fi
+    if ((REPO_FAILED)); then
+      printf '%s\tREPOSITORY_QUERY_FAILED\tSkipped repeated network query after repository failure\n' "$owner" >> "$file"
+      continue
+    fi
     rc=0
-    "$PM" check-update "$owner" > "$OUT/check-update-$stage-$owner.txt" 2>&1 || rc=$?
+    pm_run query check-update "$owner" > "$OUT/check-update-$stage-$owner.txt" 2>&1 || rc=$?
     case "$rc" in
       100) result=UPDATE_AVAILABLE;;
       0) result=NO_ENABLED_REPO_UPDATE;;
       *) result=REPOSITORY_QUERY_FAILED;;
     esac
     printf '%s\t%s\t%s\n' "$owner" "$result" "$vendor" >> "$file"
+    if [[ "$result" == REPOSITORY_QUERY_FAILED ]]; then
+      REPO_FAILED=1
+      continue
+    fi
     # A diagnostic comparison only; real updates continue to respect exclusions.
     rc=0
-    "$PM" --disableexcludes=all check-update "$owner" > "$OUT/no-excludes-$stage-$owner.txt" 2>&1 || rc=$?
+    pm_run query --disableexcludes=all check-update "$owner" > "$OUT/no-excludes-$stage-$owner.txt" 2>&1 || rc=$?
+    if [[ "$rc" != 0 && "$rc" != 100 ]]; then REPO_FAILED=1; continue; fi
+    if [[ "$rc" != 0 && "$rc" != 100 ]]; then REPO_FAILED=1; continue; fi
+    if [[ "$rc" != 0 && "$rc" != 100 ]]; then REPO_FAILED=1; continue; fi
+    if [[ "$rc" != 0 && "$rc" != 100 ]]; then REPO_FAILED=1; continue; fi
+    if [[ "$rc" != 0 && "$rc" != 100 ]]; then REPO_FAILED=1; continue; fi
     if [[ "$result" == NO_ENABLED_REPO_UPDATE && "$rc" == 100 ]]; then
       printf '%s\tBLOCKED_BY_EXCLUSION\tupdate appears only when excludes are ignored; configuration unchanged\n' "$owner" >> "$file"
     fi
-    "$PM" list --showduplicates "$owner" > "$OUT/available-$stage-$owner.txt" 2>&1 || true
+    pm_run query list --showduplicates "$owner" > "$OUT/available-$stage-$owner.txt" 2>&1 || REPO_FAILED=1
     if [[ "$owner" == ea-php7[0-3]* ]]; then
       printf '%s\tUPGRADE_OR_ELS_REQUIRED\tcheck vhost usage; migrate with compatibility testing or vendor ELS\n' "$owner" >> "$file"
     fi
@@ -224,7 +282,9 @@ if [[ -f "$OUT/running-services-before.txt" ]]; then
   mapfile -t SERVICES < <(awk '$1 ~ /(php.*fpm|httpd|apache2|lsws|litespeed|frankenphp).*\.service$/ {print $1}' "$OUT/running-services-before.txt")
 fi
 if ((NEEDS)); then
-  if [[ "$PM" == dnf ]]; then "$PM" --refresh makecache || true; else "$PM" makecache || true; fi
+  if ((REPO_FAILED == 0)); then
+    pm_run query makecache --refresh || REPO_FAILED=1
+  fi
   diagnose_updates before
 fi
 if ((NEEDS == 0)) && [[ -s "$OUT/versions-before.tsv" ]]; then
@@ -242,7 +302,10 @@ else
   [[ -s "$OUT/versions-before.tsv" ]] || color "$YELLOW" '  - No readable PHP runtime discovered; coverage unknown.'
   color "$YELLOW" 'Vendor backports may fix older versions; version numbers alone cannot verify them.'
   show_diagnosis before
-  if ((${#PKGS[@]})); then
+  if ((REPO_FAILED)); then
+    UPDATE=REPOSITORY_FAILED; FAILED=1
+    color "$RED" '  Update blocked: repository access failed. Fix repository connectivity and rerun.'
+  elif ((${#PKGS[@]})); then
     echo 'Packages proposed for update:'; printf '%s\n' "${PKGS[@]}"
     echo 'Services proposed for restart:'; printf '%s\n' "${SERVICES[@]}"
     color "$BLUE" 'Repositories, streams, exclusions and version locks will remain unchanged.'
@@ -254,11 +317,9 @@ else
     echo "User approval: ${APPROVE:-declined}"
     if [[ "$APPROVE" == y || "$APPROVE" == Y ]]; then
       UPDATE=FAILED
-      (
-        if [[ "$PM" == dnf ]]; then "$PM" --refresh makecache; else "$PM" makecache; fi &&
-          "$PM" -y --setopt=gpgcheck=1 update "${PKGS[@]}"
-      ) &
-      if wait "$!"; then UPDATE=TRANSACTION_OK; fi
+      if pm_run transaction -y --setopt=gpgcheck=1 update "${PKGS[@]}"; then
+        UPDATE=TRANSACTION_OK
+      fi
     else UPDATE=DECLINED; fi
   else UPDATE=NO_MANAGED_PACKAGES; fi
 fi
@@ -282,7 +343,7 @@ if [[ "$UPDATE" == TRANSACTION_OK ]]; then
       if systemctl restart "$svc" && systemctl is-active --quiet "$svc"; then
         echo "Restart successful: $svc"
       else
-        echo "Restart FAILED: $svc"; RESTART=FAILED; FAILED=1
+        color "$RED" "  ERROR: service restart failed: $svc"; RESTART=FAILED; FAILED=1
       fi
     done
   fi
@@ -322,10 +383,15 @@ fi
 echo 'Full before/after inventories:'
 cat "$OUT/versions-before.tsv" "$OUT/versions-after.tsv"
 color "$BLUE" 'Summary'
+if ((ERROR_COUNT)); then
+  color "$RED" "  Errors: $ERROR_COUNT failed package-manager operation(s); see log."
+  FAILED=1
+fi
 if [[ -f "$OUT/diagnosis-after.tsv" ]]; then show_diagnosis after; fi
 case "$UPDATE" in
   PACKAGES_UPDATED) color "$GREEN" '  Update: packages changed successfully.';;
   NOT_NEEDED) color "$GREEN" '  Update: not needed for discovered binaries.';;
+  REPOSITORY_FAILED) color "$RED" '  Update: not attempted; repository access failed.'; FAILED=1;;
   FAILED) color "$RED" '  Update: FAILED; partial changes possible.'; FAILED=1;;
   NO_PACKAGE_CHANGE) color "$YELLOW" '  Update: no package changes; see repository/backport diagnosis in log.';;
   DECLINED) color "$YELLOW" '  Update: declined.';;

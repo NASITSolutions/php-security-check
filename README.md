@@ -2,7 +2,7 @@
 
 A Linux Bash utility for assessing and updating discovered PHP installations against **CVE-2026-109618** and **CVE-2026-109619**. Developed by [NAS Solutions](https://nassolutions.sa).
 
-**Version:** 2.1 · **Advisory baseline:** 21 October 2026
+**Version:** 2.2 · **Advisory baseline:** 21 October 2026
 
 ## What it does
 
@@ -35,7 +35,8 @@ Older/EOL branches, prereleases and unreadable/unknown versions require vendor v
 - Standard GNU/Linux command-line utilities (including `find`, `sort`, `awk`, `grep`, `readlink` and `rpm`).
 - Access to configured package repositories.
 - `systemctl` for automatic service discovery/restarts. Custom/panel-managed workers need separate verification.
-- Optional: Python 3 for disabled repository domain classification; `timeout` for bounded version probes.
+- GNU `timeout` and GNU `tail` (with `--pid`) are required for bounded repository queries and live error monitoring.
+- Optional: Python 3 for disabled repository domain classification.
 
 Designed for RPM-based environments such as AlmaLinux, Rocky Linux and RHEL-compatible systems. Compatibility with every distribution, control panel and package-manager version is not guaranteed. It does not support apt-based systems or macOS.
 
@@ -113,3 +114,14 @@ Copyright (c) 2026 NAS Solutions. All rights reserved.
 Website: https://nassolutions.sa
 
 Public visibility does not grant an open-source license. No additional license is granted by this repository.
+
+## Quiet execution and visible errors (v2.2)
+
+Normal package-manager output stays in the log. Up to four error lines per command are displayed immediately in red, including repository/Curl failures; a nonzero failure also displays its exit status and log path. Exit 100 from check-update means updates are available and is not an error.
+
+Read-only repository queries have a 90-second wall-clock limit (plus up to 5 seconds for termination), a 15-second network timeout and one retry. After a repository query failure, repeated per-package network queries are skipped and installation is blocked for that run. Repair repository connectivity and rerun; repositories are never silently disabled. The final summary counts failed package-manager operations and exits nonzero if any occurred.
+
+Package installation has network timeout/retry settings but is deliberately not forcibly killed by a wall-clock timer, to avoid interrupting RPM writes. This is quiet execution within the connected session, not a detached service. Full output is recorded in per-command side files immediately and consolidated into operation.log when each command finishes and at final reporting.
+
+Validation for v2.2: Bash syntax plus mocked success, check-update exit 100, repository failure visibility, timeout reporting and failure counters. The live monitor used a portable stand-in on macOS; GNU/Linux integration and a real package transaction were not run.
+
